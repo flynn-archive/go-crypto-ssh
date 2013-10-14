@@ -179,6 +179,13 @@ type channelRequestMsg struct {
 	RequestSpecificData []byte `ssh:"rest"`
 }
 
+type channelExitStatusMsg struct {
+	PeersId    uint32
+	Request    string
+	WantReply  bool
+	ExitStatus uint32
+}
+
 // See RFC 4254, section 5.4.
 type channelRequestSuccessMsg struct {
 	PeersId uint32

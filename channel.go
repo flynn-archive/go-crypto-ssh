@@ -39,9 +39,15 @@ type Channel interface {
 	Write(data []byte) (int, error)
 	Close() error
 
+	// Exit sends an exit status message and closes
+	Exit(status uint) error
+
 	// Stderr returns an io.Writer that writes to this channel with the
 	// extended data type set to stderr.
 	Stderr() io.Writer
+
+	// ReadRequest pulls any pending ChannelRequest objects
+	ReadRequest() (ChannelRequest, error)
 
 	// AckRequest either sends an ack or nack to the channel request.
 	AckRequest(ok bool) error
@@ -424,6 +430,44 @@ func (c *serverChan) AckRequest(ok bool) error {
 		PeersId: c.remoteId,
 	}
 	return c.writePacket(marshal(msgChannelSuccess, ack))
+}
+
+func (c *serverChan) sendExit(status uint) error {
+	c.serverConn.lock.Lock()
+	defer c.serverConn.lock.Unlock()
+
+	if c.serverConn.err != nil {
+		return c.serverConn.err
+	}
+
+	exitstatus := channelExitStatusMsg{
+		PeersId:    c.remoteId,
+		Request:    "exit-status",
+		WantReply:  false,
+		ExitStatus: uint32(status),
+	}
+	return c.writePacket(marshal(msgChannelRequest, exitstatus))
+}
+
+func (c *serverChan) Exit(status uint) error {
+	err := c.sendExit(status)
+	if err != nil {
+		return err
+	}
+	return c.Close()
+}
+
+func (c *serverChan) ReadRequest() (ChannelRequest, error) {
+	buf := make([]byte, 256)
+	_, err := c.Read(buf)
+	if err == nil {
+		return ChannelRequest{}, errors.New("ssh: no channel request")
+	}
+	req, ok := err.(ChannelRequest)
+	if !ok {
+		return ChannelRequest{}, err
+	}
+	return req, nil
 }
 
 func (c *serverChan) ChannelType() string {
