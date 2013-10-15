@@ -309,10 +309,6 @@ func (c *serverChan) read(data []byte) (n int, err error, windowAdjustment uint3
 	}
 
 	for {
-		if c.theySentEOF || c.theyClosed || c.dead() {
-			return 0, io.EOF, 0
-		}
-
 		if len(c.pendingRequests) > 0 {
 			req := c.pendingRequests[0]
 			if len(c.pendingRequests) == 1 {
@@ -326,6 +322,10 @@ func (c *serverChan) read(data []byte) (n int, err error, windowAdjustment uint3
 			return 0, req, 0
 		}
 
+		if c.theySentEOF || c.theyClosed || c.dead() {
+			err = io.EOF
+		}
+
 		if c.length > 0 {
 			tail := min(uint32(c.head+c.length), len(c.pendingData))
 			n = copy(data, c.pendingData[c.head:tail])
@@ -334,13 +334,19 @@ func (c *serverChan) read(data []byte) (n int, err error, windowAdjustment uint3
 			if c.head == len(c.pendingData) {
 				c.head = 0
 			}
-
-			windowAdjustment = uint32(len(c.pendingData)-c.length) - c.myWindow
-			if windowAdjustment < uint32(len(c.pendingData)/2) {
-				windowAdjustment = 0
+			if c.length > 0 {
+				err = nil
 			}
-			c.myWindow += windowAdjustment
 
+			if err == nil {
+				windowAdjustment = uint32(len(c.pendingData)-c.length) - c.myWindow
+				if windowAdjustment < uint32(len(c.pendingData)/2) {
+					windowAdjustment = 0
+				}
+				c.myWindow += windowAdjustment
+			}
+		}
+		if n > 0 || err != nil {
 			return
 		}
 
