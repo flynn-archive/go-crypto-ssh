@@ -323,6 +323,7 @@ func (c *serverChan) read(data []byte) (n int, err error, windowAdjustment uint3
 		}
 
 		if c.theySentEOF || c.theyClosed || c.dead() {
+			// Set the error, but don't return yet as there may still be pending data.
 			err = io.EOF
 		}
 
@@ -334,16 +335,16 @@ func (c *serverChan) read(data []byte) (n int, err error, windowAdjustment uint3
 			if c.head == len(c.pendingData) {
 				c.head = 0
 			}
-			if c.length > 0 {
-				err = nil
-			}
-
 			if err == nil {
 				windowAdjustment = uint32(len(c.pendingData)-c.length) - c.myWindow
 				if windowAdjustment < uint32(len(c.pendingData)/2) {
 					windowAdjustment = 0
 				}
 				c.myWindow += windowAdjustment
+			}
+			if c.length > 0 {
+				// Don't return EOF if there is still pending data.
+				err = nil
 			}
 		}
 		if n > 0 || err != nil {
