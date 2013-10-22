@@ -118,6 +118,10 @@ type ServerConn struct {
 	// any authentication callback is called and not assigned to after that.
 	User string
 
+	// PublicKey holds the PublicKey object used for successful authentication.
+	// It is empty if no public key authentication is used.
+	PublicKey PublicKey
+
 	// ClientVersion is the client's version, populated after
 	// Handshake is called. It should not be modified.
 	ClientVersion []byte
@@ -416,6 +420,7 @@ userAuthLoop:
 				}
 				// TODO(jmpittman): Implement full validation for certificates.
 				s.User = userAuthReq.User
+				s.PublicKey = key
 				if s.testPubKey(userAuthReq.User, algo, pubKey) {
 					break userAuthLoop
 				}
