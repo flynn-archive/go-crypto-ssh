@@ -294,6 +294,7 @@ userAuthLoop:
 				return nil, parseError(msgUserAuthRequest)
 			}
 
+			s.password = password
 			perms, authErr = config.PasswordCallback(s, password)
 		case "keyboard-interactive":
 			if config.KeyboardInteractiveCallback == nil {
@@ -339,6 +340,7 @@ userAuthLoop:
 			}
 			candidate.result, ok = cache.get(candidate)
 			if !ok {
+				s.pubKey = pubKey
 				candidate.perms, candidate.result = config.PublicKeyCallback(s, pubKey)
 				if candidate.result == nil && candidate.perms != nil && candidate.perms.CriticalOptions != nil && candidate.perms.CriticalOptions[sourceAddressCriticalOption] != "" {
 					candidate.result = checkSourceAddress(

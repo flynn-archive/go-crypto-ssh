@@ -42,6 +42,12 @@ type ConnMetadata interface {
 
 	// LocalAddr returns the local address for this connection.
 	LocalAddr() net.Addr
+
+	// Password returns the password used to authenticate this connection.
+	Password() []byte
+
+	// PublicKey returns the public key used to authenticated this connection.
+	PublicKey() PublicKey
 }
 
 // Conn represents an SSH connection for both server and client roles.
@@ -104,6 +110,8 @@ type sshConn struct {
 	conn net.Conn
 
 	user          string
+	password      []byte
+	pubKey        PublicKey
 	sessionID     []byte
 	clientVersion []byte
 	serverVersion []byte
@@ -141,4 +149,12 @@ func (c *sshConn) ClientVersion() []byte {
 
 func (c *sshConn) ServerVersion() []byte {
 	return dup(c.serverVersion)
+}
+
+func (c *sshConn) Password() []byte {
+	return dup(c.password)
+}
+
+func (c *sshConn) PublicKey() PublicKey {
+	return c.pubKey
 }
