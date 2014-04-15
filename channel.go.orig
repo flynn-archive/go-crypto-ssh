@@ -127,6 +127,474 @@ func (r RejectionReason) String() string {
 	return fmt.Sprintf("unknown reason %d", int(r))
 }
 
+<<<<<<< local
+type channel struct {
+	packetConn        // the underlying transport
+	localId, remoteId uint32
+	remoteWin         window
+	maxPacket         uint32
+	isClosed          uint32 // atomic bool, non zero if true
+}
+
+func (c *channel) sendWindowAdj(n int) error {
+	msg := windowAdjustMsg{
+		PeersId:         c.remoteId,
+		AdditionalBytes: uint32(n),
+	}
+	return c.writePacket(marshal(msgChannelWindowAdjust, msg))
+}
+
+// sendEOF sends EOF to the remote side. RFC 4254 Section 5.3
+func (c *channel) sendEOF() error {
+	return c.writePacket(marshal(msgChannelEOF, channelEOFMsg{
+		PeersId: c.remoteId,
+	}))
+}
+
+// sendClose informs the remote side of our intent to close the channel.
+func (c *channel) sendClose() error {
+	return c.packetConn.writePacket(marshal(msgChannelClose, channelCloseMsg{
+		PeersId: c.remoteId,
+	}))
+}
+
+func (c *channel) sendChannelOpenFailure(reason RejectionReason, message string) error {
+	reject := channelOpenFailureMsg{
+		PeersId:  c.remoteId,
+		Reason:   reason,
+		Message:  message,
+		Language: "en",
+	}
+	return c.writePacket(marshal(msgChannelOpenFailure, reject))
+}
+
+func (c *channel) writePacket(b []byte) error {
+	if c.closed() {
+		return io.EOF
+	}
+	if uint32(len(b)) > c.maxPacket {
+		return fmt.Errorf("ssh: cannot write %d bytes, maxPacket is %d bytes", len(b), c.maxPacket)
+	}
+	return c.packetConn.writePacket(b)
+}
+
+func (c *channel) closed() bool {
+	return atomic.LoadUint32(&c.isClosed) > 0
+}
+
+func (c *channel) setClosed() bool {
+	return atomic.CompareAndSwapUint32(&c.isClosed, 0, 1)
+}
+
+type serverChan struct {
+	channel
+	// immutable once created
+	chanType  string
+	extraData []byte
+
+	serverConn  *ServerConn
+	myWindow    uint32
+	theyClosed  bool // indicates the close msg has been received from the remote side
+	theySentEOF bool
+	isDead      uint32
+	err         error
+
+	pendingRequests []ChannelRequest
+	pendingData     []byte
+	head, length    int
+
+	// This lock is inferior to serverConn.lock
+	cond *sync.Cond
+}
+
+func (c *serverChan) Accept() error {
+	c.serverConn.lock.Lock()
+	defer c.serverConn.lock.Unlock()
+
+	if c.serverConn.err != nil {
+		return c.serverConn.err
+	}
+
+	confirm := channelOpenConfirmMsg{
+		PeersId:       c.remoteId,
+		MyId:          c.localId,
+		MyWindow:      c.myWindow,
+		MaxPacketSize: c.maxPacket,
+	}
+	return c.writePacket(marshal(msgChannelOpenConfirm, confirm))
+}
+
+func (c *serverChan) Reject(reason RejectionReason, message string) error {
+	c.serverConn.lock.Lock()
+	defer c.serverConn.lock.Unlock()
+
+	if c.serverConn.err != nil {
+		return c.serverConn.err
+	}
+
+	return c.sendChannelOpenFailure(reason, message)
+}
+
+func (c *serverChan) handlePacket(packet interface{}) {
+	c.cond.L.Lock()
+	defer c.cond.L.Unlock()
+
+	switch packet := packet.(type) {
+	case *channelRequestMsg:
+		req := ChannelRequest{
+			Request:   packet.Request,
+			WantReply: packet.WantReply,
+			Payload:   packet.RequestSpecificData,
+		}
+
+		c.pendingRequests = append(c.pendingRequests, req)
+		c.cond.Signal()
+	case *channelCloseMsg:
+		c.theyClosed = true
+		c.cond.Signal()
+	case *channelEOFMsg:
+		c.theySentEOF = true
+		c.cond.Signal()
+	case *windowAdjustMsg:
+		if !c.remoteWin.add(packet.AdditionalBytes) {
+			panic("illegal window update")
+		}
+	default:
+		panic("unknown packet type")
+	}
+}
+
+func (c *serverChan) handleData(data []byte) {
+	c.cond.L.Lock()
+	defer c.cond.L.Unlock()
+
+	// The other side should never send us more than our window.
+	if len(data)+c.length > len(c.pendingData) {
+		// TODO(agl): we should tear down the channel with a protocol
+		// error.
+		return
+	}
+
+	c.myWindow -= uint32(len(data))
+	for i := 0; i < 2; i++ {
+		tail := c.head + c.length
+		if tail >= len(c.pendingData) {
+			tail -= len(c.pendingData)
+		}
+		n := copy(c.pendingData[tail:], data)
+		data = data[n:]
+		c.length += n
+	}
+
+	c.cond.Signal()
+}
+
+func (c *serverChan) Stderr() io.Writer {
+	return extendedDataChannel{c: c, t: extendedDataStderr}
+}
+
+// extendedDataChannel is an io.Writer that writes any data to c as extended
+// data of the given type.
+type extendedDataChannel struct {
+	t extendedDataTypeCode
+	c *serverChan
+}
+
+func (edc extendedDataChannel) Write(data []byte) (n int, err error) {
+	const headerLength = 13 // 1 byte message type, 4 bytes remoteId, 4 bytes extended message type, 4 bytes data length
+	c := edc.c
+	for len(data) > 0 {
+		space := min(c.maxPacket-headerLength, len(data))
+		if space, err = c.getWindowSpace(space); err != nil {
+			return 0, err
+		}
+		todo := data
+		if uint32(len(todo)) > space {
+			todo = todo[:space]
+		}
+
+		packet := make([]byte, headerLength+len(todo))
+		packet[0] = msgChannelExtendedData
+		marshalUint32(packet[1:], c.remoteId)
+		marshalUint32(packet[5:], uint32(edc.t))
+		marshalUint32(packet[9:], uint32(len(todo)))
+		copy(packet[13:], todo)
+
+		if err = c.writePacket(packet); err != nil {
+			return
+		}
+
+		n += len(todo)
+		data = data[len(todo):]
+	}
+
+	return
+}
+
+func (c *serverChan) Read(data []byte) (n int, err error) {
+	n, err, windowAdjustment := c.read(data)
+
+	if windowAdjustment > 0 {
+		packet := marshal(msgChannelWindowAdjust, windowAdjustMsg{
+			PeersId:         c.remoteId,
+			AdditionalBytes: windowAdjustment,
+		})
+		err = c.writePacket(packet)
+	}
+
+	return
+}
+
+func (c *serverChan) read(data []byte) (n int, err error, windowAdjustment uint32) {
+	c.cond.L.Lock()
+	defer c.cond.L.Unlock()
+
+	if c.err != nil {
+		return 0, c.err, 0
+	}
+
+	for {
+		if len(c.pendingRequests) > 0 {
+			req := c.pendingRequests[0]
+			if len(c.pendingRequests) == 1 {
+				c.pendingRequests = nil
+			} else {
+				oldPendingRequests := c.pendingRequests
+				c.pendingRequests = make([]ChannelRequest, len(oldPendingRequests)-1)
+				copy(c.pendingRequests, oldPendingRequests[1:])
+			}
+
+			return 0, req, 0
+		}
+
+		if c.theySentEOF || c.theyClosed || c.dead() {
+			// Set the error, but don't return yet as there may still be pending data.
+			err = io.EOF
+		}
+
+		if c.length > 0 {
+			tail := min(uint32(c.head+c.length), len(c.pendingData))
+			n = copy(data, c.pendingData[c.head:tail])
+			c.head += n
+			c.length -= n
+			if c.head == len(c.pendingData) {
+				c.head = 0
+			}
+			if err == nil {
+				windowAdjustment = uint32(len(c.pendingData)-c.length) - c.myWindow
+				if windowAdjustment < uint32(len(c.pendingData)/2) {
+					windowAdjustment = 0
+				}
+				c.myWindow += windowAdjustment
+			}
+			if c.length > 0 {
+				// Don't return EOF if there is still pending data.
+				err = nil
+			}
+		}
+		if n > 0 || err != nil {
+			return
+		}
+
+		c.cond.Wait()
+	}
+
+	panic("unreachable")
+}
+
+// getWindowSpace takes, at most, max bytes of space from the peer's window. It
+// returns the number of bytes actually reserved.
+func (c *serverChan) getWindowSpace(max uint32) (uint32, error) {
+	if c.dead() || c.closed() {
+		return 0, io.EOF
+	}
+	return c.remoteWin.reserve(max), nil
+}
+
+func (c *serverChan) dead() bool {
+	return atomic.LoadUint32(&c.isDead) > 0
+}
+
+func (c *serverChan) setDead() {
+	atomic.StoreUint32(&c.isDead, 1)
+}
+
+func (c *serverChan) Write(data []byte) (n int, err error) {
+	const headerLength = 9 // 1 byte message type, 4 bytes remoteId, 4 bytes data length
+	for len(data) > 0 {
+		space := min(c.maxPacket-headerLength, len(data))
+		if space, err = c.getWindowSpace(space); err != nil {
+			return 0, err
+		}
+		todo := data
+		if uint32(len(todo)) > space {
+			todo = todo[:space]
+		}
+
+		packet := make([]byte, headerLength+len(todo))
+		packet[0] = msgChannelData
+		marshalUint32(packet[1:], c.remoteId)
+		marshalUint32(packet[5:], uint32(len(todo)))
+		copy(packet[9:], todo)
+
+		if err = c.writePacket(packet); err != nil {
+			return
+		}
+
+		n += len(todo)
+		data = data[len(todo):]
+	}
+
+	return
+}
+
+// Close signals the intent to close the channel.
+func (c *serverChan) Close() error {
+	c.serverConn.lock.Lock()
+	defer c.serverConn.lock.Unlock()
+
+	if c.serverConn.err != nil {
+		return c.serverConn.err
+	}
+
+	if !c.setClosed() {
+		return errors.New("ssh: channel already closed")
+	}
+	return c.sendClose()
+}
+
+func (c *serverChan) AckRequest(ok bool) error {
+	c.serverConn.lock.Lock()
+	defer c.serverConn.lock.Unlock()
+
+	if c.serverConn.err != nil {
+		return c.serverConn.err
+	}
+
+	if !ok {
+		ack := channelRequestFailureMsg{
+			PeersId: c.remoteId,
+		}
+		return c.writePacket(marshal(msgChannelFailure, ack))
+	}
+
+	ack := channelRequestSuccessMsg{
+		PeersId: c.remoteId,
+	}
+	return c.writePacket(marshal(msgChannelSuccess, ack))
+}
+
+func (c *serverChan) ChannelType() string {
+	return c.chanType
+}
+
+func (c *serverChan) ExtraData() []byte {
+	return c.extraData
+}
+
+// A clientChan represents a single RFC 4254 channel multiplexed
+// over a SSH connection.
+type clientChan struct {
+	channel
+	stdin  *chanWriter
+	stdout *chanReader
+	stderr *chanReader
+	msg    chan interface{}
+}
+
+// newClientChan returns a partially constructed *clientChan
+// using the local id provided. To be usable clientChan.remoteId
+// needs to be assigned once known.
+func newClientChan(cc packetConn, id uint32) *clientChan {
+	c := &clientChan{
+		channel: channel{
+			packetConn: cc,
+			localId:    id,
+			remoteWin:  window{Cond: newCond()},
+		},
+		msg: make(chan interface{}, 16),
+	}
+	c.stdin = &chanWriter{
+		channel: &c.channel,
+	}
+	c.stdout = &chanReader{
+		channel: &c.channel,
+		buffer:  newBuffer(),
+	}
+	c.stderr = &chanReader{
+		channel: &c.channel,
+		buffer:  newBuffer(),
+	}
+	return c
+}
+
+// waitForChannelOpenResponse, if successful, fills out
+// the remoteId and records any initial window advertisement.
+func (c *clientChan) waitForChannelOpenResponse() error {
+	switch msg := (<-c.msg).(type) {
+	case *channelOpenConfirmMsg:
+		if msg.MaxPacketSize < minPacketLength || msg.MaxPacketSize > 1<<31 {
+			return errors.New("ssh: invalid MaxPacketSize from peer")
+		}
+		// fixup remoteId field
+		c.remoteId = msg.MyId
+		c.maxPacket = msg.MaxPacketSize
+		c.remoteWin.add(msg.MyWindow)
+		return nil
+	case *channelOpenFailureMsg:
+		return errors.New(safeString(msg.Message))
+	}
+	return errors.New("ssh: unexpected packet")
+}
+
+// Close signals the intent to close the channel.
+func (c *clientChan) Close() error {
+	if !c.setClosed() {
+		return errors.New("ssh: channel already closed")
+	}
+	c.stdout.eof()
+	c.stderr.eof()
+	return c.sendClose()
+}
+
+// A chanWriter represents the stdin of a remote process.
+type chanWriter struct {
+	*channel
+	// indicates the writer has been closed. eof is owned by the
+	// caller of Write/Close.
+	eof bool
+}
+
+// Write writes data to the remote process's standard input.
+func (w *chanWriter) Write(data []byte) (written int, err error) {
+	const headerLength = 9 // 1 byte message type, 4 bytes remoteId, 4 bytes data length
+	for len(data) > 0 {
+		if w.eof || w.closed() {
+			err = io.EOF
+			return
+		}
+		// never send more data than maxPacket even if
+		// there is sufficient window.
+		n := min(w.maxPacket-headerLength, len(data))
+		r := w.remoteWin.reserve(n)
+		n = r
+		remoteId := w.remoteId
+		packet := []byte{
+			msgChannelData,
+			byte(remoteId >> 24), byte(remoteId >> 16), byte(remoteId >> 8), byte(remoteId),
+			byte(n >> 24), byte(n >> 16), byte(n >> 8), byte(n),
+		}
+		if err = w.writePacket(append(packet, data[:n]...)); err != nil {
+			break
+		}
+		data = data[n:]
+		written += int(n)
+	}
+	return
+}
+
+=======
+>>>>>>> other
 func min(a uint32, b int) uint32 {
 	if a < uint32(b) {
 		return a

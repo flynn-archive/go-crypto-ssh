@@ -372,6 +372,41 @@ func TestServerWindow(t *testing.T) {
 	}
 }
 
+func TestClientWriteEOF(t *testing.T) {
+	conn := dial(simpleEchoHandler, t)
+	defer conn.Close()
+
+	session, err := conn.NewSession()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	stdin, err := session.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe failed: %v", err)
+	}
+	stdout, err := session.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe failed: %v", err)
+	}
+
+	data := []byte(`0000`)
+	_, err = stdin.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+	stdin.Close()
+
+	res, err := ioutil.ReadAll(stdout)
+	if err != nil {
+		t.Fatalf("Read failed: %v", err)
+	}
+
+	if !bytes.Equal(data, res) {
+		t.Fatalf("Read differed from write, wrote: %v, read: %v", data, res)
+	}
+}
+
 // Verify the client can handle a keepalive packet from the server.
 func TestClientHandlesKeepalives(t *testing.T) {
 	conn := dial(channelKeepaliveSender, t)
@@ -537,6 +572,18 @@ func echoHandler(ch Channel, in <-chan *Request, t *testing.T) {
 	defer ch.Close()
 	if n, err := copyNRandomly("echohandler", ch, ch, windowTestBytes); err != nil {
 		t.Errorf("short write, wrote %d, expected %d: %v ", n, windowTestBytes, err)
+	}
+}
+
+func simpleEchoHandler(ch *serverChan, t *testing.T) {
+	defer ch.Close()
+	data, err := ioutil.ReadAll(ch)
+	if err != nil {
+		t.Errorf("handler read error: %v", err)
+	}
+	_, err = ch.Write(data)
+	if err != nil {
+		t.Errorf("handler write error: %v", err)
 	}
 }
 
