@@ -111,6 +111,29 @@ func TestAuthMethodPassword(t *testing.T) {
 	}
 }
 
+func TestAuthMethodFallback(t *testing.T) {
+	var passwordCalled bool
+	config := &ClientConfig{
+		User: "testuser",
+		Auth: []AuthMethod{
+			PublicKeys(testSigners["rsa"]),
+			PasswordCallback(
+				func() (string, error) {
+					passwordCalled = true
+					return "WRONG", nil
+				}),
+		},
+	}
+
+	if err := tryAuth(t, config); err != nil {
+		t.Fatalf("unable to dial remote side: %s", err)
+	}
+
+	if passwordCalled {
+		t.Errorf("password auth tried before public-key auth.")
+	}
+}
+
 func TestAuthMethodWrongPassword(t *testing.T) {
 	config := &ClientConfig{
 		User: "testuser",
@@ -319,4 +342,52 @@ func TestClientLoginCert(t *testing.T) {
 	if err := tryAuth(t, clientConfig); err == nil {
 		t.Errorf("cert login with source-address succeeded")
 	}
+}
+
+func testPermissionsPassing(withPermissions bool, t *testing.T) {
+	serverConfig := &ServerConfig{
+		PublicKeyCallback: func(conn ConnMetadata, key PublicKey) (*Permissions, error) {
+			if conn.User() == "nopermissions" {
+				return nil, nil
+			} else {
+				return &Permissions{}, nil
+			}
+		},
+	}
+	serverConfig.AddHostKey(testSigners["rsa"])
+
+	clientConfig := &ClientConfig{
+		Auth: []AuthMethod{
+			PublicKeys(testSigners["rsa"]),
+		},
+	}
+	if withPermissions {
+		clientConfig.User = "permissions"
+	} else {
+		clientConfig.User = "nopermissions"
+	}
+
+	c1, c2, err := netPipe()
+	if err != nil {
+		t.Fatalf("netPipe: %v", err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+
+	go NewClientConn(c2, "", clientConfig)
+	serverConn, err := newServer(c1, serverConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := serverConn.Permissions; (p != nil) != withPermissions {
+		t.Fatalf("withPermissions is %t, but Permissions object is %#v", withPermissions, p)
+	}
+}
+
+func TestPermissionsPassing(t *testing.T) {
+	testPermissionsPassing(true, t)
+}
+
+func TestNoPermissionsPassing(t *testing.T) {
+	testPermissionsPassing(false, t)
 }
